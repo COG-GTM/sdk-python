@@ -25,7 +25,13 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import StatusCode, get_tracer
 
 from temporalio import activity, nexus, workflow
-from temporalio.client import Client, WithStartWorkflowOperation, WorkflowUpdateStage
+from temporalio.client import (
+    Client,
+    OutboundInterceptor,
+    WithStartWorkflowOperation,
+    WorkflowUpdateStage,
+)
+from temporalio.client import Interceptor as ClientInterceptor
 from temporalio.common import RetryPolicy, WorkflowIDConflictPolicy
 from temporalio.contrib.opentelemetry import (
     OpenTelemetryInterceptor,
@@ -43,6 +49,7 @@ from temporalio.exceptions import (
     ApplicationErrorCategory,
     NexusOperationError,
 )
+from temporalio.service import RPCError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import (
     ExecuteWorkflowInput,
@@ -440,6 +447,7 @@ async def test_opentelemetry_tracing(client: Client, env: WorkflowEnvironment):
         "SignalWorkflow:signal",
         "StartWorkflowUpdate:update",
     ]
+    assert_namespace_on_spans(exporter.get_finished_spans(), client.namespace)
 
 
 async def test_opentelemetry_tracing_update_with_start(
@@ -533,6 +541,7 @@ async def test_opentelemetry_tracing_update_with_start(
         "  MyCustomSpan",
         "  CompleteWorkflow:TracingWorkflow",
     ]
+    assert_namespace_on_spans(exporter.get_finished_spans(), client.namespace)
 
 
 @pytest.mark.requires_local_server
@@ -595,6 +604,72 @@ async def test_opentelemetry_tracing_nexus(client: Client, env: WorkflowEnvironm
         "    RunCancelNexusOperationHandler:InterceptedNexusService/intercepted_operation",
         "  CompleteWorkflow:TracingWorkflow",
     ]
+    assert_namespace_on_spans(exporter.get_finished_spans(), client.namespace)
+
+
+def assert_namespace_on_spans(
+    spans: Iterable[ReadableSpan],
+    namespace: str,
+    *,
+    only: Callable[[ReadableSpan], bool] = lambda _: True,
+) -> None:
+    checked = [span for span in spans if only(span)]
+    assert checked
+    mismatched = {
+        span.name: (span.attributes or {}).get("temporalNamespace")
+        for span in checked
+        if (span.attributes or {}).get("temporalNamespace") != namespace
+    }
+    assert not mismatched, (
+        f"Spans without temporalNamespace={namespace!r}: {mismatched}"
+    )
+
+
+class _PassthroughClientInterceptor(ClientInterceptor):
+    def intercept_client(self, next: OutboundInterceptor) -> OutboundInterceptor:
+        return OutboundInterceptor(next)
+
+
+@pytest.mark.parametrize("interceptor_type", ["tracing", "otel"])
+async def test_opentelemetry_client_span_namespace_from_client(
+    client: Client,
+    interceptor_type: str,
+    reset_otel_tracer_provider: Any,  # type: ignore[reportUnusedParameter]
+):
+    # Uses a namespace that does not exist so the call fails after the client
+    # span is created, which avoids needing to register a namespace.
+    namespace = f"namespace-{uuid.uuid4()}"
+    exporter = InMemorySpanExporter()
+    if interceptor_type == "tracing":
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        tracing_interceptor: ClientInterceptor = TracingInterceptor(
+            get_tracer(__name__, tracer_provider=provider)
+        )
+    else:
+        replay_safe_provider = create_tracer_provider()
+        replay_safe_provider.add_span_processor(SimpleSpanProcessor(exporter))
+        opentelemetry.trace.set_tracer_provider(replay_safe_provider)
+        tracing_interceptor = OpenTelemetryInterceptor(add_temporal_spans=True)
+    client_config = client.config()
+    client_config["namespace"] = namespace
+    # Another interceptor below the tracing one must not hide the namespace
+    client_config["interceptors"] = [
+        tracing_interceptor,
+        _PassthroughClientInterceptor(),
+    ]
+    client = Client(**client_config)
+
+    with pytest.raises(RPCError):
+        await client.start_workflow(
+            SimpleWorkflow.run,
+            id=f"workflow_{uuid.uuid4()}",
+            task_queue=f"task_queue_{uuid.uuid4()}",
+        )
+
+    spans = exporter.get_finished_spans()
+    assert [span.name for span in spans] == ["StartWorkflow:SimpleWorkflow"]
+    assert_namespace_on_spans(spans, namespace)
 
 
 def dump_spans(
@@ -1056,6 +1131,7 @@ async def test_opentelemetry_standalone_activity_tracing(
     assert start_activity_span.attributes is not None
     assert start_activity_span.attributes["temporalActivityID"] == activity_id
     assert start_activity_span.attributes["temporalActivityType"] == "tracing_activity"
+    assert_namespace_on_spans(finished_spans, client.namespace)
 
 
 def _v1_workflow_context(success_is_complete: bool = True) -> Any:

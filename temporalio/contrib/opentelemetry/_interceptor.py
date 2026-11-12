@@ -33,6 +33,7 @@ import temporalio.api.common.v1
 import temporalio.client
 import temporalio.converter
 import temporalio.exceptions
+import temporalio.nexus
 import temporalio.nexus.system.workflow_service.models
 import temporalio.worker
 import temporalio.workflow
@@ -58,6 +59,24 @@ default_text_map_propagator = opentelemetry.propagators.composite.CompositePropa
 _CarrierDict: TypeAlias = dict[str, opentelemetry.propagators.textmap.CarrierValT]
 
 _ContextT = TypeVar("_ContextT", bound=nexusrpc.handler.OperationContext)
+
+
+def _client_namespace(next: temporalio.client.OutboundInterceptor) -> str | None:
+    # Client interceptors are not given the client, so walk the chain down to
+    # the SDK's terminal implementation, which holds it.
+    current: object = next
+    while current is not None:
+        client = getattr(current, "_client", None)
+        if isinstance(client, temporalio.client.Client):
+            return client.namespace
+        current = getattr(current, "next", None)
+    return None
+
+
+def _namespace_attributes(
+    namespace: str | None,
+) -> dict[str, opentelemetry.util.types.AttributeValue]:
+    return {"temporalNamespace": namespace} if namespace else {}
 
 
 class TracingInterceptor(temporalio.client.Interceptor, temporalio.worker.Interceptor):
@@ -269,6 +288,7 @@ class _TracingClientOutboundInterceptor(temporalio.client.OutboundInterceptor):
     ) -> None:
         super().__init__(next)
         self.root = root
+        self._namespace_attributes = _namespace_attributes(_client_namespace(next))
 
     async def start_workflow(
         self, input: temporalio.client.StartWorkflowInput
@@ -278,7 +298,10 @@ class _TracingClientOutboundInterceptor(temporalio.client.OutboundInterceptor):
         )
         with self.root._start_as_current_span(
             f"{prefix}:{input.workflow}",
-            attributes={"temporalWorkflowID": input.id},
+            attributes={
+                "temporalWorkflowID": input.id,
+                **self._namespace_attributes,
+            },
             input_with_headers=input,
             kind=opentelemetry.trace.SpanKind.CLIENT,
         ):
@@ -287,7 +310,10 @@ class _TracingClientOutboundInterceptor(temporalio.client.OutboundInterceptor):
     async def query_workflow(self, input: temporalio.client.QueryWorkflowInput) -> Any:
         with self.root._start_as_current_span(
             f"QueryWorkflow:{input.query}",
-            attributes={"temporalWorkflowID": input.id},
+            attributes={
+                "temporalWorkflowID": input.id,
+                **self._namespace_attributes,
+            },
             input_with_headers=input,
             kind=opentelemetry.trace.SpanKind.CLIENT,
         ):
@@ -298,7 +324,10 @@ class _TracingClientOutboundInterceptor(temporalio.client.OutboundInterceptor):
     ) -> None:
         with self.root._start_as_current_span(
             f"SignalWorkflow:{input.signal}",
-            attributes={"temporalWorkflowID": input.id},
+            attributes={
+                "temporalWorkflowID": input.id,
+                **self._namespace_attributes,
+            },
             input_with_headers=input,
             kind=opentelemetry.trace.SpanKind.CLIENT,
         ):
@@ -309,7 +338,10 @@ class _TracingClientOutboundInterceptor(temporalio.client.OutboundInterceptor):
     ) -> temporalio.client.WorkflowUpdateHandle[Any]:
         with self.root._start_as_current_span(
             f"StartWorkflowUpdate:{input.update}",
-            attributes={"temporalWorkflowID": input.id},
+            attributes={
+                "temporalWorkflowID": input.id,
+                **self._namespace_attributes,
+            },
             input_with_headers=input,
             kind=opentelemetry.trace.SpanKind.CLIENT,
         ):
@@ -318,8 +350,9 @@ class _TracingClientOutboundInterceptor(temporalio.client.OutboundInterceptor):
     async def start_update_with_start_workflow(
         self, input: temporalio.client.StartWorkflowUpdateWithStartInput
     ) -> temporalio.client.WorkflowUpdateHandle[Any]:
-        attrs = {
+        attrs: dict[str, opentelemetry.util.types.AttributeValue] = {
             "temporalWorkflowID": input.start_workflow_input.id,
+            **self._namespace_attributes,
         }
         if input.update_workflow_input.update_id is not None:
             attrs["temporalUpdateID"] = input.update_workflow_input.update_id
@@ -347,6 +380,7 @@ class _TracingClientOutboundInterceptor(temporalio.client.OutboundInterceptor):
             attributes={
                 "temporalActivityID": input.id,
                 "temporalActivityType": input.activity_type,
+                **self._namespace_attributes,
             },
             input_with_headers=input,
             kind=opentelemetry.trace.SpanKind.CLIENT,
@@ -367,7 +401,10 @@ class _TracingActivityInboundInterceptor(temporalio.worker.ActivityInboundInterc
         self, input: temporalio.worker.ExecuteActivityInput
     ) -> Any:
         info = temporalio.activity.info()
-        attributes: dict[str, str] = {"temporalActivityID": info.activity_id}
+        attributes: dict[str, str] = {
+            "temporalActivityID": info.activity_id,
+            "temporalNamespace": info.namespace,
+        }
         if info.workflow_id:
             attributes["temporalWorkflowID"] = info.workflow_id
         if info.workflow_run_id:
@@ -404,7 +441,7 @@ class _TracingNexusOperationInboundInterceptor(
         with self._root._start_as_current_span(
             f"RunStartNexusOperationHandler:{input.ctx.service}/{input.ctx.operation}",
             context=self._context_from_nexus_headers(input.ctx.headers),
-            attributes={},
+            attributes=_nexus_namespace_attributes(),
             input_with_ctx=input,
             kind=opentelemetry.trace.SpanKind.SERVER,
         ):
@@ -416,11 +453,17 @@ class _TracingNexusOperationInboundInterceptor(
         with self._root._start_as_current_span(
             f"RunCancelNexusOperationHandler:{input.ctx.service}/{input.ctx.operation}",
             context=self._context_from_nexus_headers(input.ctx.headers),
-            attributes={},
+            attributes=_nexus_namespace_attributes(),
             input_with_ctx=input,
             kind=opentelemetry.trace.SpanKind.SERVER,
         ):
             return await self.next.execute_nexus_operation_cancel(input)
+
+
+def _nexus_namespace_attributes() -> dict[str, opentelemetry.util.types.AttributeValue]:
+    if not temporalio.nexus.in_operation():
+        return {}
+    return _namespace_attributes(temporalio.nexus.info().namespace)
 
 
 class _InputWithHeaders(Protocol):
@@ -708,6 +751,7 @@ class TracingWorkflowInboundInterceptor(temporalio.worker.WorkflowInboundInterce
         attributes: dict[str, opentelemetry.util.types.AttributeValue] = {
             "temporalWorkflowID": info.workflow_id,
             "temporalRunID": info.run_id,
+            "temporalNamespace": info.namespace,
         }
 
         if additional_attributes:
@@ -718,7 +762,7 @@ class TracingWorkflowInboundInterceptor(temporalio.worker.WorkflowInboundInterce
             _CompletedWorkflowSpanParams(
                 context=new_context_carrier,
                 name=span_name,
-                # Always set span attributes as workflow ID and run ID
+                # Always set span attributes as workflow ID, run ID, and namespace
                 attributes=attributes,
                 time_ns=temporalio.workflow.time_ns(),
                 link_context=link_context_carrier,

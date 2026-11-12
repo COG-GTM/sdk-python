@@ -34,8 +34,8 @@ def completed_span(
 
     Args:
         name: Name of the span.
-        attributes: Attributes to set on the span if any. Workflow ID and
-            run ID are automatically added.
+        attributes: Attributes to set on the span if any. Workflow ID,
+            run ID, and namespace are automatically added.
         exception: Optional exception to record on the span.
     """
     if interceptor := TracingWorkflowInboundInterceptor._from_context():

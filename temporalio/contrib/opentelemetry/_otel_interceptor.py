@@ -36,6 +36,11 @@ import temporalio.nexus.system.workflow_service.models
 import temporalio.worker
 import temporalio.workflow
 from temporalio.contrib.opentelemetry._context import attached_context
+from temporalio.contrib.opentelemetry._interceptor import (
+    _client_namespace,
+    _namespace_attributes,
+    _nexus_namespace_attributes,
+)
 from temporalio.contrib.opentelemetry._tracer_provider import (
     ReplaySafeTracerProvider,
 )
@@ -223,6 +228,7 @@ class _TracingClientOutboundInterceptor(temporalio.client.OutboundInterceptor):
     ) -> None:
         super().__init__(next)
         self._add_temporal_spans = add_temporal_spans
+        self._namespace_attributes = _namespace_attributes(_client_namespace(next))
 
     async def start_workflow(
         self, input: temporalio.client.StartWorkflowInput
@@ -234,7 +240,10 @@ class _TracingClientOutboundInterceptor(temporalio.client.OutboundInterceptor):
             get_tracer(__name__),
             f"{prefix}:{input.workflow}",
             add_temporal_spans=self._add_temporal_spans,
-            attributes={"temporalWorkflowID": input.id},
+            attributes={
+                "temporalWorkflowID": input.id,
+                **self._namespace_attributes,
+            },
             kind=opentelemetry.trace.SpanKind.CLIENT,
         ):
             input.headers = _context_to_headers(input.headers)
@@ -245,7 +254,10 @@ class _TracingClientOutboundInterceptor(temporalio.client.OutboundInterceptor):
             get_tracer(__name__),
             f"QueryWorkflow:{input.query}",
             add_temporal_spans=self._add_temporal_spans,
-            attributes={"temporalWorkflowID": input.id},
+            attributes={
+                "temporalWorkflowID": input.id,
+                **self._namespace_attributes,
+            },
             kind=opentelemetry.trace.SpanKind.CLIENT,
         ):
             input.headers = _context_to_headers(input.headers)
@@ -258,7 +270,10 @@ class _TracingClientOutboundInterceptor(temporalio.client.OutboundInterceptor):
             get_tracer(__name__),
             f"SignalWorkflow:{input.signal}",
             add_temporal_spans=self._add_temporal_spans,
-            attributes={"temporalWorkflowID": input.id},
+            attributes={
+                "temporalWorkflowID": input.id,
+                **self._namespace_attributes,
+            },
             kind=opentelemetry.trace.SpanKind.CLIENT,
         ):
             input.headers = _context_to_headers(input.headers)
@@ -271,7 +286,10 @@ class _TracingClientOutboundInterceptor(temporalio.client.OutboundInterceptor):
             get_tracer(__name__),
             f"StartWorkflowUpdate:{input.update}",
             add_temporal_spans=self._add_temporal_spans,
-            attributes={"temporalWorkflowID": input.id},
+            attributes={
+                "temporalWorkflowID": input.id,
+                **self._namespace_attributes,
+            },
             kind=opentelemetry.trace.SpanKind.CLIENT,
         ):
             input.headers = _context_to_headers(input.headers)
@@ -280,8 +298,9 @@ class _TracingClientOutboundInterceptor(temporalio.client.OutboundInterceptor):
     async def start_update_with_start_workflow(
         self, input: temporalio.client.StartWorkflowUpdateWithStartInput
     ) -> temporalio.client.WorkflowUpdateHandle[Any]:
-        attrs = {
+        attrs: dict[str, opentelemetry.util.types.AttributeValue] = {
             "temporalWorkflowID": input.start_workflow_input.id,
+            **self._namespace_attributes,
         }
         if input.update_workflow_input.update_id is not None:
             attrs["temporalUpdateID"] = input.update_workflow_input.update_id
@@ -311,6 +330,7 @@ class _TracingClientOutboundInterceptor(temporalio.client.OutboundInterceptor):
             attributes={
                 "temporalActivityID": input.id,
                 "temporalActivityType": input.activity_type,
+                **self._namespace_attributes,
             },
             kind=opentelemetry.trace.SpanKind.CLIENT,
         ):
@@ -341,6 +361,7 @@ class _TracingActivityInboundInterceptor(temporalio.worker.ActivityInboundInterc
                     "temporalWorkflowID": info.workflow_id or "",
                     "temporalRunID": info.workflow_run_id or "",
                     "temporalActivityID": info.activity_id,
+                    "temporalNamespace": info.namespace,
                 },
                 kind=opentelemetry.trace.SpanKind.SERVER,
             ):
@@ -375,7 +396,7 @@ class _TracingNexusOperationInboundInterceptor(
                 get_tracer(__name__),
                 f"RunStartNexusOperationHandler:{input.ctx.service}/{input.ctx.operation}",
                 add_temporal_spans=self._add_temporal_spans,
-                attributes={},
+                attributes=_nexus_namespace_attributes(),
                 kind=opentelemetry.trace.SpanKind.SERVER,
             ):
                 return await self.next.execute_nexus_operation_start(input)
@@ -388,7 +409,7 @@ class _TracingNexusOperationInboundInterceptor(
                 get_tracer(__name__),
                 f"RunCancelNexusOperationHandler:{input.ctx.service}/{input.ctx.operation}",
                 add_temporal_spans=self._add_temporal_spans,
-                attributes={},
+                attributes=_nexus_namespace_attributes(),
                 kind=opentelemetry.trace.SpanKind.SERVER,
             ):
                 return await self.next.execute_nexus_operation_cancel(input)
@@ -421,6 +442,7 @@ class _TracingWorkflowInboundInterceptor(temporalio.worker.WorkflowInboundInterc
         attributes: dict[str, opentelemetry.util.types.AttributeValue] = {
             "temporalWorkflowID": info.workflow_id,
             "temporalRunID": info.run_id,
+            "temporalNamespace": info.namespace,
         }
         with _maybe_span(
             get_tracer(__name__),
@@ -513,6 +535,7 @@ class _TracingWorkflowOutboundInterceptor(
         attributes: dict[str, opentelemetry.util.types.AttributeValue] = {
             "temporalWorkflowID": info.workflow_id,
             "temporalRunID": info.run_id,
+            "temporalNamespace": info.namespace,
         }
         with _maybe_span(
             get_tracer(__name__),
