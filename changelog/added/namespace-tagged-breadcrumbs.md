@@ -1,0 +1,1 @@
+Add a `temporalNamespace` attribute to all spans created by the `temporalio.contrib.opentelemetry` tracing interceptors, set to the client namespace for client spans and the workflow, activity, or Nexus operation namespace for worker spans.

@@ -30,7 +30,10 @@ from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 
 # Import the dump_spans function from the original opentelemetry test
-from tests.contrib.opentelemetry.test_opentelemetry import dump_spans
+from tests.contrib.opentelemetry.test_opentelemetry import (
+    assert_namespace_on_spans,
+    dump_spans,
+)
 from tests.helpers import assert_eventually, new_worker
 from tests.helpers.nexus import make_nexus_endpoint_name
 
@@ -456,6 +459,10 @@ async def test_opentelemetry_comprehensive_tracing(
     actual_hierarchy = dump_spans(spans, with_attributes=False)
     assert actual_hierarchy == expected_hierarchy, (
         f"Span hierarchy mismatch.\nExpected:\n{expected_hierarchy}\nActual:\n{actual_hierarchy}"
+    )
+    # Only spans created by the interceptor, user spans are untouched
+    assert_namespace_on_spans(
+        spans, new_client.namespace, only=lambda span: ":" in span.name
     )
 
 
